@@ -1,0 +1,20 @@
+
+# 基础框架与核心服务
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9
+
+# 异步任务与消息队列
+celery>=5.3.4
+redis>=5.0.1
+
+# 配置与工具
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.1
+python-multipart>=0.0.6  # 用于处理文件上传
+python-magic>=0.4.27  # 用于识别文件类型
+
+# 第三方AI服务
+# baidu-aip>=4.16.15  # 百度OCR SDK
+qianfan>=0.1.0  # 千帆大模型 SDK
