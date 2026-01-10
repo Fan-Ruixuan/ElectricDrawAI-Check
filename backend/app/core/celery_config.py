@@ -8,7 +8,7 @@ celery_app = Celery(
     "drawing_review_tasks",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["app.tasks.cad_tasks"]  # 任务所在的模块路径
+    include=["app.tasks.cad_tasks", "app.tasks.ocr_tasks"]  # 任务所在的模块路径
 )
 
 # 配置Celery
@@ -18,4 +18,6 @@ celery_app.conf.update(
     accept_content=["json"],
     task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
     worker_concurrency=4,  # 工作进程数，可根据CPU核心调整
+    timezone='Asia/Shanghai',
+    enable_utc=True,
 )

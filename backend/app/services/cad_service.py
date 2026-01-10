@@ -1,5 +1,7 @@
 import sys
 import os
+import io
+from pdf2image import convert_from_bytes  # PDF转图片需用到
 import subprocess
 import logging
 from pathlib import Path
@@ -7,6 +9,10 @@ from typing import Optional
 import ezdxf
 from ezdxf.addons.drawing import RenderContext, Frontend
 from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+from app.services.ocr_service import perform_ocr_service
+from app.services.ai_service import ai_review_service
+from app.services.common_service import generate_report_service
+from pdf2image import convert_from_bytes
 
 # 从utiils导入
 from app.utils.file_utils import save_temp_file, _get_project_root
@@ -27,12 +33,42 @@ class CADRenderError(Exception):
     """CAD文件渲染为PNG过程中发生的错误"""
     pass
 
+def process_image_service (file_content: bytes, filename: str) -> dict:
+    """处理图片文件的业务逻辑"""
+    try:
+        # 调用 OCR 服务
+        ocr_result = perform_ocr_service (file_content, "image")
+        if ocr_result ["status"] != "success":
+            return ocr_result # 直接返回错误结果
+        # 调用 AI 审查服务
+        ai_result = ai_review_service([ocr_result["structured_data"]], filename)
+        if ai_result ["status"] != "success":
+            return ai_result # 直接返回错误结果
+        # 调用报告生成服务
+        report = generate_report_service (ai_result, filename)
+        return{
+            "status": "success",
+            "result": {
+                "ocr": ocr_result,
+                "ai_review": ai_result,
+                "report": report
+            },
+            "message": "图片文件处理完成"    
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str (e),
+            "message": "图片文件处理失败"
+        }
 
-"""[AI辅助生成]CAD 服务模块
+
+
+
+"""以下内容：[AI辅助生成]CAD 服务模块
 本模块负责处理 CAD 文件的转换和渲染。
 其中，convert_dwg_to_dxf_from_path 函数的核心逻辑已通过 AI 辅助重构，
-将一个复杂的大函数拆分为多个职责单一的小函数，极大提升代码的可读性、可维护性和可测试性。"""
-
+将一个复杂的大函数拆分为多个职责单一的小函数，极大提升代码的可读性、可维护性和可测试性."""
 
 def _validate_dwg_exists(dwg_file_path: str) -> Path:
     """
@@ -218,12 +254,23 @@ def convert_dwg_to_dxf_from_path(dwg_file_path: str, output_dxf_path: Optional[s
 
 def convert_dwg_to_dxf_from_bytes(file_content: bytes, filename: str) -> dict:
     """将二进制的 DWG 文件内容转换为 DXF"""
-    # 1. 将二进制内容保存为临时文件
+    # 1. 将二进制内容保存为临时文件（先定义变量，再判断）
     temp_file_path = save_temp_file(file_content, filename)
-    # 2. 直接调用之前优化好的函数(调用 ODA 转换器进行格式转换)
-    dxf_file_path = convert_dwg_to_dxf_from_path(temp_file_path)
-    # 3. 返回结果
-    return {"dxf_file": os.path.basename(dxf_file_path), "original_filename": filename}
+    
+    # 2. 检查临时文件是否存在（exists是方法，需要加括号）
+    if not Path(temp_file_path).exists():
+        raise FileNotFoundError(f"临时文件{temp_file_path}未成功创建")
+    
+    # 3. 直接调用之前优化好的函数(调用 ODA 转换器进行格式转换)
+    dxf_file_path = convert_dwg_to_dxf_from_path(str(temp_file_path))  # 确保传入字符串路径
+    
+    # 4. 返回结果（补充status字段，和其他服务统一）
+    return {
+        "status": "success",
+        "dxf_file": os.path.basename(dxf_file_path), 
+        "original_filename": filename,
+        "dxf_file_path": dxf_file_path  # 新增路径字段，方便后续使用
+    }
 
 
 
@@ -288,6 +335,103 @@ def cad_to_png(cad_file_path: str, output_png_path: str = "temp_cad_render.png")
         print(f"DEBUG: 渲染错误详情: {str(e)}")  # 临时打印错误信息，便于调试
         logger.exception("Failed to render CAD to PNG")
         raise CADRenderError("Failed to render CAD to PNG") from e
+
+
+def process_dxf_service(file_content: bytes, filename: str) -> dict:
+    """处理DXF文件：渲染为图片+OCR+AI审查+报告生成"""
+    try:
+        # 1. 先保存DXF二进制内容为临时文件（因为cad_to_png需要文件路径）
+        temp_dxf_path = save_temp_file(file_content, filename)
+        
+        # 2. DXF转PNG（传入临时文件路径，而非二进制）
+        png_file_path = cad_to_png(str(temp_dxf_path), f"temp_{filename}.png")
+        if not png_file_path or not Path(png_file_path).exists():
+            return {"status": "failed", "message": "DXF文件渲染图片失败"}
+        
+        # 3. 读取PNG文件为二进制（适配OCR服务入参）
+        with open(png_file_path, "rb") as f:
+            png_content = f.read()
+
+        # 4. 调用OCR服务，文件类型标记为dxf便于后续区分
+        ocr_result = perform_ocr_service(png_content, "dxf")
+        if ocr_result["status"] != "success":
+            return ocr_result
+
+        # 5. AI审查（补充drawing_name参数，适配函数定义）
+        ai_result = ai_review_service([ocr_result["structured_data"]], filename)
+        if ai_result["status"] != "success":
+            return ai_result
+
+        # 6. 生成报告
+        report = generate_report_service(ai_result, filename)
+
+        return {
+            "status": "success",
+            "result": {"ocr": ocr_result, "ai_review": ai_result, "report": report},
+            "message": "DXF文件处理完成"
+        }
+    except Exception as e:
+        logger.error(f"DXF文件处理异常：{str(e)}")
+        return {"status": "failed", "error": str(e), "message": "DXF文件处理失败"}
+
+
+def process_pdf_service(file_content: bytes, filename: str) -> dict:
+    """处理PDF文件：提取所有页面图片+批量OCR+汇总AI审查+报告生成"""
+    try:
+        # 1. PDF转图片（依赖pdf2image，需确保已安装poppler）
+        images = convert_from_bytes(file_content)
+        if not images:
+            return {"status": "failed", "message": "PDF文件无有效页面可提取"}
+        
+        all_ocr_structured = []
+        # 2. 多页PDF循环做OCR
+        for idx, img in enumerate(images):
+            # 图片转bytes（适配perform_ocr_service入参）
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='PNG')
+            img_bytes = img_byte_arr.getvalue()
+            
+            ocr_res = perform_ocr_service(img_bytes, "pdf")
+            if ocr_res["status"] != "success":
+                logger.warning(f"PDF第{idx+1}页OCR失败：{ocr_res.get('error')}")
+                continue
+            all_ocr_structured.append(ocr_res["structured_data"])
+        
+        if not all_ocr_structured:
+            return {"status": "failed", "message": "PDF所有页面OCR识别失败"}
+
+        # 3. 汇总OCR结果做AI审查
+        ai_result = ai_review_service(all_ocr_structured, filename)
+        if ai_result["status"] != "success":
+            return ai_result
+
+        # 4. 生成报告
+        report = generate_report_service(ai_result, filename)
+
+        return {
+            "status": "success",
+            "result": {"ocr_page_count": len(all_ocr_structured), "ocr": all_ocr_structured, "ai_review": ai_result, "report": report},
+            "message": f"PDF文件处理完成，共识别有效页面{len(all_ocr_structured)}页"
+        }
+    except ImportError as e:
+        logger.error(f"PDF处理依赖缺失：{str(e)}，需安装pdf2image和poppler")
+        return {"status": "failed", "error": str(e), "message": "PDF处理依赖未安装，请安装pdf2image"}
+    except Exception as e:
+        logger.error(f"PDF文件处理异常：{str(e)}")
+        return {"status": "failed", "error": str(e), "message": "PDF文件处理失败"}
+
+
+def render_cad_to_image(dxf_file_path: str) -> str:
+    """
+    将DXF文件渲染为图片
+    :param dxf_file_path: DXF文件的路径
+    :return: 生成的图片文件路径
+    """
+    # 1. 这里需要实现DXF到图片的渲染逻辑
+    # 2. 可以使用 ezdxf、matplotlib 等库来读取并渲染DXF文件
+    # 3. 将渲染结果保存为图片，例如PNG格式
+    # 4. 返回图片的路径
+    pass
 
 """TODO: [未来优化] 考虑与 extract_layers_from_dxf 函数集成
 集成后，该函数可返回一个包含 "png_path" 和 "extracted_layers" 的字典，

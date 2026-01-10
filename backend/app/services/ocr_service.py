@@ -6,13 +6,43 @@ import traceback
 from PIL import Image, ImageOps, ImageFilter
 ImageFilter
 import fitz  # PyMuPDF
-from app.core.config import OCR_API_KEY, OCR_SECRET_KEY
+from app.core.config import settings
+from app.tasks.ocr_tasks import perform_ocr
+
+
+def perform_ocr_service (file_content: bytes, file_type: str) -> dict:
+    """封装 OCR 的业务逻辑"""
+    try:
+        # 根据文件类型进行不同的预处理
+        if file_type in ["dxf", "dwg"]:
+            # 先调用 CAD 服务将图纸渲染为图片
+            from app.services.cad_service import render_cad_to_image
+            image_content = render_cad_to_image(file_content, file_type)
+            # 再对渲染后的图片进行OCR
+            ocr_result = perform_ocr.delay(image_content, file_type="image").get()
+        else:
+            # PDF 和图片直接调用 OCR 任务
+            ocr_result = perform_ocr.delay(file_content, file_type=file_type).get()
+            # 处理OCR结果
+            if ocr_result ["status"] != "success":
+                return{
+                    "status": "failed",
+                    "message": "OCR 识别失败",
+                    "error": ocr_result.get("error")
+                }
+        return ocr_result
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str (e),
+            "message": "OCR 服务调用失败"
+        }
 
 
 def get_baidu_access_token():
     """获取百度 API 的 access_token"""
-    OCR_API_KEY = os.getenv("OCR_API_KEY")
-    OCR_SECRET_KEY = os.getenv("OCR_SECRET_KEY")
+    OCR_API_KEY = settings.OCR_API_KEY
+    OCR_SECRET_KEY = settings.OCR_SECRET_KEY
     if not OCR_API_KEY or not OCR_SECRET_KEY:
         return None
     token_url = "https://aip.baidubce.com/oauth/2.0/token"

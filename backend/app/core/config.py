@@ -45,10 +45,17 @@ class Settings(BaseSettings):
     CELERY_TASK_TIME_LIMIT: int = 3600  # 任务超时时间（秒）
 
     # 百度 OCR 配置
+    OCR_APP_ID: str
     OCR_API_KEY: str
     OCR_SECRET_KEY: str
-    # BAIDU_OCR_ENGINE_PATH: str = "./engine"
 
+    # Tesseract OCR 配置
+    TESSERACT_OEM: int = 3  # OCR引擎模式
+    TESSERACT_PDF_PSM: int = 4  # 页面分割模式
+    TESSERACT_IMAGE_PSM: int = 6  # 图片页面分割模式
+    TESSERACT_PRESERVE_SPACES: bool = True  # 保留空格选项
+    TESSERACT_CMD_PATH: str = r'd:\Program Files\Tesseract-OCR\tesseract.exe'  # Tesseract可执行文件路径
+    
     # 大模型配置
     ERNIE_API_KEY: str
     ERNIE_API_URL: str
