@@ -3,6 +3,8 @@ import pytesseract
 from PIL import Image
 from aip import AipOcr
 from app.core.config import settings
+import io
+from fastapi import UploadFile
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,56 @@ class OCRStrategyService:
             for k in self.tesseract_config:
                 self.tesseract_config[k] += ' -c preserve_interword_spaces=1'
 
+    async def process_file(self, file: UploadFile) -> dict:
+        """
+        异步处理上传文件（适配FastAPI的UploadFile）
+        :param file: FastAPI上传的文件对象
+        :return: 标准化的OCR结果字典（适配OCRResult模型）
+        """
+        try:
+            # 1. 读取上传文件并转换为PIL Image
+            file_content = await file.read()
+            image = Image.open(io.BytesIO(file_content))
+            
+            # 2. 判断文件类型（PDF/图片）
+            file_suffix = file.filename.split(".")[-1].lower() if "." in file.filename else ""
+            if file_suffix == "pdf" or file.content_type == "application/pdf":
+                file_type = "pdf"
+            else:
+                file_type = "image"
+            
+            # 3. 调用OCR识别（默认混合策略）
+            ocr_result = self.recognize(image, file_type=file_type, strategy="hybrid")
+            
+            # 4. 封装为标准化返回格式（适配OCRResult模型）
+            if ocr_result["status"] == "success":
+                return {
+                    "status": "success",
+                    "content": ocr_result["text"],
+                    "confidence": ocr_result["confidence"],
+                    "metadata": {
+                        "engine": ocr_result["engine"],
+                        "file_name": file.filename,
+                        "content_type": file.content_type
+                    }
+                }
+            else:
+                return {
+                    "status": "failure",
+                    "error_message": ocr_result["error"],
+                    "metadata": {
+                        "engine": ocr_result["engine"],
+                        "file_name": file.filename
+                    }
+                }
+        except Exception as e:
+            logger.error(f"处理上传文件失败：{str(e)}", exc_info=True)
+            return {
+                "status": "failure",
+                "error_message": str(e),
+                "metadata": {"file_name": file.filename}
+            }
+
     def recognize(self, image: Image.Image, file_type: str = "image", strategy: str = "hybrid") -> dict:
         # 3种策略可选：hybrid(优先百度，失败降级TESS)、baidu(只用百度)、tesseract(只用TESS)
         if strategy == "baidu":
@@ -38,7 +90,6 @@ class OCRStrategyService:
     def _baidu_ocr(self, image: Image.Image) -> dict:
         # 百度OCR需转二进制，内部封装，外部不用管
         try:
-            import io
             img_byte = io.BytesIO()
             # 定义百度OCR支持的最大尺寸
             MAX_WIDTH = 4096
@@ -81,3 +132,6 @@ class OCRStrategyService:
         except Exception as e:
             logger.error(f"Tesseract OCR失败：{str(e)}")
             return {"status": "failed", "engine": "tesseract", "error": str(e)}
+
+# 关键：创建实例，名称和review_router中导入的一致
+ocr_strategy_service = OCRStrategyService()

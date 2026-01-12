@@ -1,28 +1,42 @@
 import sys
 import os
 import io
-from pdf2image import convert_from_bytes  # PDF转图片需用到
-import subprocess
 import logging
+import hashlib
+logging.getLogger('ezdxf').setLevel(logging.WARNING)
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
+import subprocess
 import ezdxf
+
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from pdf2image import convert_from_bytes
 from ezdxf.addons.drawing import RenderContext, Frontend
 from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
-from app.services.ocr_service import perform_ocr_service
-from app.services.ai_service import ai_review_service
-from app.services.common_service import generate_report_service
-from pdf2image import convert_from_bytes
 
-# 从utiils导入
-from app.utils.file_utils import save_temp_file, _get_project_root
+from PIL import Image, ImageOps, ImageFilter
+import numpy as np
+import cv2
 
-#从core导入
+file_process_cache: Dict[str, dict] = {}
+CACHE_EXPIRE_SECONDS = 300
+
+
+# ========== 补充缺失的核心导入 ==========
 from app.core.config import settings
 
+# 初始化logger
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+# 修复：导入AIService类并实例化（实例名和方法名区分）
+from app.services.ai_service import AIService
+ai_service_instance = AIService() 
 
 # 定义自定义异常类
 class CADConversionError(Exception):
@@ -33,20 +47,92 @@ class CADRenderError(Exception):
     """CAD文件渲染为PNG过程中发生的错误"""
     pass
 
-def process_image_service (file_content: bytes, filename: str) -> dict:
+# ========== 补充缺失的核心依赖函数 ==========
+def _get_project_root() -> Path:
+    """获取项目根目录"""
+    return Path(__file__).parent.parent.parent  # 根据实际目录结构调整
+
+def save_temp_file(file_content: bytes, filename: str) -> str:
+    """保存二进制内容为临时文件，返回文件路径（同一文件只存一次）"""
+    file_hash = hashlib.md5(file_content).hexdigest()[:8] 
+    temp_dir = _get_project_root() / "temp" / "cad"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"{file_hash}_{filename}"  # 哈希+文件名，确保唯一
+    
+    if temp_path.exists():
+        logger.info(f"文件已存在，复用临时文件：{temp_path}")
+        return str(temp_path)
+    
+    with open(temp_path, "wb") as f:
+        f.write(file_content)
+    logger.info(f"临时文件已保存：{temp_path}")
+    return str(temp_path)
+
+# ========== 缓存处理函数 ==========
+def _get_file_hash(file_content: bytes) -> str:
+    """生成文件内容的唯一哈希（MD5保证稳定性）"""
+    return hashlib.md5(file_content).hexdigest()
+
+def clean_temp_cad_files(keep_latest: int = 10):
+    """清理临时CAD文件，保留最新10个（避免频繁创建）"""
+    temp_dir = _get_project_root() / "temp" / "cad"
+    if not temp_dir.exists():
+        return
+    
+    files = sorted(
+        temp_dir.glob("*"),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True
+    )
+    
+    for file in files[keep_latest:]:
+        try:
+            file.unlink()
+            logger.info(f"清理临时文件：{file}")
+        except Exception as e:
+            logger.warning(f"清理临时文件失败：{file}，错误：{str(e)}")
+
+def _check_cache(file_hash: str) -> Optional[dict]:
+    """检查缓存，返回有效结果或None"""
+    if file_hash not in file_process_cache:
+        return None
+    
+    cache_data = file_process_cache[file_hash]
+    if time.time() - cache_data["timestamp"] > CACHE_EXPIRE_SECONDS:
+        del file_process_cache[file_hash]
+        return None
+    
+    return cache_data
+
+def _update_cache(file_hash: str, status: str, result: dict = None):
+    """更新缓存"""
+    file_process_cache[file_hash] = {
+        "status": status,
+        "result": result,
+        "timestamp": time.time()
+    }
+
+# ========== 业务函数 ==========
+def process_image_service(file_content: bytes, filename: str) -> dict:
     """处理图片文件的业务逻辑"""
+    # 延迟导入，解决循环依赖
+    from app.services.ocr_service import perform_ocr_service
+    from app.services.common_service import generate_report_service
+    
     try:
         # 调用 OCR 服务
-        ocr_result = perform_ocr_service (file_content, "image")
-        if ocr_result ["status"] != "success":
-            return ocr_result # 直接返回错误结果
-        # 调用 AI 审查服务
-        ai_result = ai_review_service([ocr_result["structured_data"]], filename)
-        if ai_result ["status"] != "success":
-            return ai_result # 直接返回错误结果
+        ocr_result = perform_ocr_service(file_content, "image")
+        if ocr_result["status"] != "success":
+            return ocr_result
+        
+        # 修复1：调用实例的ai_review_service方法
+        ai_result = ai_service_instance.ai_review_service(ocr_result["structured_data"], filename)
+        if ai_result["status"] != "success":
+            return ai_result
+        
         # 调用报告生成服务
-        report = generate_report_service (ai_result, filename)
-        return{
+        report = generate_report_service(ai_result, filename)
+        return {
             "status": "success",
             "result": {
                 "ocr": ocr_result,
@@ -56,37 +142,23 @@ def process_image_service (file_content: bytes, filename: str) -> dict:
             "message": "图片文件处理完成"    
         }
     except Exception as e:
+        logger.error(f"图片文件处理失败：{str(e)}", exc_info=True)
         return {
             "status": "failed",
-            "error": str (e),
+            "error": str(e),
             "message": "图片文件处理失败"
         }
 
-
-
-
-"""以下内容：[AI辅助生成]CAD 服务模块
-本模块负责处理 CAD 文件的转换和渲染。
-其中，convert_dwg_to_dxf_from_path 函数的核心逻辑已通过 AI 辅助重构，
-将一个复杂的大函数拆分为多个职责单一的小函数，极大提升代码的可读性、可维护性和可测试性."""
-
 def _validate_dwg_exists(dwg_file_path: str) -> Path:
-    """
-    Validate that the DWG file exists and return its Path.
-    Raises FileNotFoundError if missing.
-    """
+    """验证DWG文件存在，返回Path对象"""
     dwg_path = Path(dwg_file_path)
     if not dwg_path.exists():
         logger.error("DWG file not found: %s", dwg_file_path)
         raise FileNotFoundError(f"DWG file not found: {dwg_file_path}")
     return dwg_path
 
-
 def _get_and_validate_converter_path() -> Path:
-    """
-    Get ODA converter path from settings and validate it exists.
-    Raises FileNotFoundError if missing.
-    """
+    """获取并验证ODA转换器路径"""
     converter_path_str = settings.ODA_CONVERTER_PATH
     converter_path = Path(converter_path_str)
     if not converter_path.exists():
@@ -94,8 +166,8 @@ def _get_and_validate_converter_path() -> Path:
         raise FileNotFoundError(f"ODA converter not found: {converter_path}")
     return converter_path
 
-
 def _determine_output_dxf_path(dwg_path: Path, output_dxf_path: Optional[str]) -> Path:
+    """确定DXF输出路径"""
     if output_dxf_path:
         out_path = Path(output_dxf_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,37 +175,33 @@ def _determine_output_dxf_path(dwg_path: Path, output_dxf_path: Optional[str]) -
         project_root = _get_project_root()
         out_folder = project_root / "temp" / "output"
         out_folder.mkdir(parents=True, exist_ok=True)
-        # 确保正确处理文件名
         dxf_filename = dwg_path.stem + ".dxf"
         out_path = out_folder / dxf_filename
     return out_path
 
+def _build_oda_converter_command(converter_path: Path, input_file: str, output_folder: str) -> list:
+    """严格对齐ODA官方命令格式"""
+    input_folder = str(Path(input_file).parent)
+    file_filter = Path(input_file).name
 
-def _build_oda_converter_command(converter_path: Path, input_folder: str, output_folder: str) -> list:
-    """
-    Build the command string to invoke ODAFileConverter.
-    """
+    quoted_converter = f'"{str(converter_path)}"'
+    quoted_input_folder = f'"{input_folder}"'
+    quoted_output_folder = f'"{output_folder}"'
+    quoted_filter = f'"{file_filter}"'
+
     return [
-        str(converter_path),
-        input_folder,
-        output_folder,
+        quoted_converter,
+        quoted_input_folder,
+        quoted_output_folder,
         settings.ODA_TARGET_VERSION,
-        settings.ODA_OUTPUT_FORMAT,
-        settings.ODA_OTHER_PARAM_1,
-        settings.ODA_OTHER_PARAM_2
+        "DXF",
+        settings.ODA_OTHER_PARAM_1,  # 填0
+        settings.ODA_OTHER_PARAM_2,  # 填1
+        quoted_filter
     ]
 
-
-
-"""[以下单个函数由 github Copilot 优化完善，提高代码健壮性]"""
 def extract_layers_from_dxf(dxf_file_path: str, target_layers: list = None) -> dict:
-    """从 DXF 文件中提取指定图层的所有实体。
-    Args:
-        dxf_file_path: DXF 文件的路径。
-        target_layers: 需要提取的图层名称列表。如果为 None，则提取所有图层。
-    Returns:
-        一个字典，键是图层名称，值是该图层上所有实体的列表，每个实体包含其类型和基本属性。
-    """
+    """从 DXF 文件中提取指定图层的所有实体"""
     if target_layers is None:
         target_layers = []
 
@@ -146,8 +214,7 @@ def extract_layers_from_dxf(dxf_file_path: str, target_layers: list = None) -> d
         doc = ezdxf.readfile(str(dxf_path))
         msp = doc.modelspace()
     except Exception as e:
-        print(f"DEBUG: 读取DXF文件错误详情: {str(e)}")  # 临时打印错误信息，便于调试    
-        logger.exception("读取 DXF 文件失败: %s", dxf_path)
+        logger.error(f"读取DXF文件错误详情: {str(e)}", exc_info=True)
         raise CADConversionError(f"读取 DXF 文件失败: {dxf_path}") from e
 
     extracted_data = {}
@@ -155,7 +222,6 @@ def extract_layers_from_dxf(dxf_file_path: str, target_layers: list = None) -> d
         try:
             entity_layer = entity.dxf.layer
         except Exception:
-            # Skip entities without layer info
             continue
 
         if target_layers and entity_layer not in target_layers:
@@ -194,94 +260,88 @@ def extract_layers_from_dxf(dxf_file_path: str, target_layers: list = None) -> d
     )
     return extracted_data
 
-
-
-
 def convert_dwg_to_dxf_from_path(dwg_file_path: str, output_dxf_path: Optional[str] = None) -> str:
-    """
-    Convert a .dwg file to .dxf using ODAFileConverter.
-    Orchestrates validation, path resolution, command construction and execution.
-    Returns the absolute path to the generated .dxf file.
-    """
+    """将DWG文件转换为DXF（通过ODA转换器，增加重试和兼容）"""
     dwg_path = _validate_dwg_exists(dwg_file_path)
     converter_path = _get_and_validate_converter_path()
     out_path = _determine_output_dxf_path(dwg_path, output_dxf_path)
 
-    input_folder = str(dwg_path.parent)
-    output_folder = str(out_path.parent)
-    cmd = _build_oda_converter_command(converter_path, input_folder, output_folder)
+    # 重试机制：最多重试1次
+    max_retries = 1
+    retry_count = 0
+    while retry_count < max_retries:
+        input_file = str(dwg_path)
+        output_folder = str(out_path.parent)
+        cmd = _build_oda_converter_command(converter_path, input_file, output_folder)
 
-    logger.debug("Executing ODAFileConverter: %s", cmd)
-    print(f"执行的命令: {cmd}")  # 临时打印命令，便于调试
+        logger.debug("Executing ODAFileConverter (重试%d): %s", retry_count, " ".join(cmd))
 
-    try:
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            timeout=300
-        )
+        try:
+            cmd_str = " ".join(cmd)
+            result = subprocess.run(
+                cmd_str, 
+                capture_output=True, 
+                text=True, 
+                timeout=120,
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"ODAFileConverter 超时错误详情: {str(e)}", exc_info=True)
+            retry_count += 1
+            continue
+        except Exception as e:
+            logger.error(f"执行ODAFileConverter错误详情: {str(e)}", exc_info=True)
+            retry_count += 1
+            continue
 
-    except subprocess.TimeoutExpired as e:
-        print(f"DEBUG: ODAFileConverter 超时错误详情: {str(e)}")  # 临时打印错误信息，便于调试
-        logger.exception("ODAFileConverter timed out")
-        raise CADConversionError("ODAFileConverter timed out") from e
-    except Exception as e:
-        print(f"DEBUG: 执行ODAFileConverter错误详情: {str(e)}")  # 临时打印错误信息，便于调试
-        logger.exception("Failed to execute ODAFileConverter")
-        raise CADConversionError("Failed to execute ODAFileConverter") from e
-
-    print(f"DEBUG: out_path is {out_path}")
-    print(f"DEBUG: out_path.exists() is {out_path.exists()}")
-
-    if result.returncode == 0 and out_path.exists():
-        logger.info(
-            "DWG转换为DXF成功",
-            extra={
-            "input_file": str(dwg_path),
-            "output_file": str(out_path)
-            }
-        )
-        return str(out_path.resolve())
-    else:
-        logger.error(
-            "DWG conversion failed (code=%s). stdout: %s stderr: %s",
-            result.returncode,
-            result.stdout,
-            result.stderr,
-        )
-        raise CADConversionError(f"DWG conversion failed: {result.stderr or result.stdout}")
+        if result.returncode == 0 and out_path.exists():
+            try:
+                ezdxf.readfile(str(out_path))
+            except Exception as e:
+                logger.error(f"生成的DXF文件无效：{str(e)}", exc_info=True)
+                retry_count += 1
+                continue
+            
+            logger.info(
+                "DWG转换为DXF成功",
+                extra={
+                    "input_file": str(dwg_path),
+                    "output_file": str(out_path)
+                }
+            )
+            return str(out_path.resolve())
+        else:
+            logger.error(
+                "DWG conversion failed (code=%s). stdout: %s stderr: %s",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
+            retry_count += 1
+    
+    # 所有重试失败
+    raise CADConversionError(f"DWG转换失败（已重试{max_retries}次）：{result.stderr or result.stdout}")
 
 def convert_dwg_to_dxf_from_bytes(file_content: bytes, filename: str) -> dict:
     """将二进制的 DWG 文件内容转换为 DXF"""
-    # 1. 将二进制内容保存为临时文件（先定义变量，再判断）
     temp_file_path = save_temp_file(file_content, filename)
     
-    # 2. 检查临时文件是否存在（exists是方法，需要加括号）
     if not Path(temp_file_path).exists():
         raise FileNotFoundError(f"临时文件{temp_file_path}未成功创建")
     
-    # 3. 直接调用之前优化好的函数(调用 ODA 转换器进行格式转换)
-    dxf_file_path = convert_dwg_to_dxf_from_path(str(temp_file_path))  # 确保传入字符串路径
+    dxf_file_path = convert_dwg_to_dxf_from_path(str(temp_file_path))
     
-    # 4. 返回结果（补充status字段，和其他服务统一）
     return {
         "status": "success",
-        "dxf_file": os.path.basename(dxf_file_path), 
+        "dxf_file": dxf_file_path, 
         "original_filename": filename,
-        "dxf_file_path": dxf_file_path  # 新增路径字段，方便后续使用
+        "dxf_file_path": dxf_file_path
     }
 
-
-
 def cad_to_png(cad_file_path: str, output_png_path: str = "temp_cad_render.png") -> str:
-    """
-    Convert a CAD file (.dwg/.dxf) to a PNG image.
-    - If input is .dwg, it will be converted to .dxf via convert_dwg_to_dxf_from_path.
-    Returns absolute path to the generated PNG.
-    """
-    from ezdxf import DXFError  # local import to keep module-level imports light
-    import matplotlib.pyplot as plt
+    """将CAD文件（DWG/DXF）转换为PNG图片"""
+    from ezdxf import DXFError
 
     cad_path = Path(cad_file_path)
     if not cad_path.exists():
@@ -298,12 +358,10 @@ def cad_to_png(cad_file_path: str, output_png_path: str = "temp_cad_render.png")
     except FileNotFoundError:
         raise
     except DXFError as e:
-        print(f"DEBUG: 无效的DXF/CAD文件错误详情: {str(e)}")  # 临时打印错误信息，便于调试
-        logger.exception("Invalid DXF/CAD file: %s", cad_path)
+        logger.error(f"无效的DXF/CAD文件错误详情: {str(e)}", exc_info=True)
         raise CADRenderError(f"Invalid DXF/CAD file: {cad_path}") from e
     except Exception as e:
-        print(f"DEBUG: 读取CAD文件错误详情: {str(e)}")  # 临时打印错误信息，便于调试
-        logger.exception("Failed to read CAD file: %s", cad_path)
+        logger.error(f"读取CAD文件错误详情: {str(e)}", exc_info=True)
         raise CADRenderError(f"Failed to read CAD file: {cad_path}") from e
 
     try:
@@ -316,14 +374,13 @@ def cad_to_png(cad_file_path: str, output_png_path: str = "temp_cad_render.png")
         ax.axis("off")
 
         out_path = Path(output_png_path)
-        # if user passed a relative path, keep it relative to project root for consistency
         if not out_path.is_absolute():
             out_path = _get_project_root() / out_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
         plt.savefig(
             str(out_path),
-            dpi=settings.CAD_RENDER_DPI,  # 使用配置的高精度DPI
+            dpi=300,
             bbox_inches="tight",
             pad_inches=0
         )
@@ -332,76 +389,157 @@ def cad_to_png(cad_file_path: str, output_png_path: str = "temp_cad_render.png")
         return str(out_path.resolve())
 
     except Exception as e:
-        print(f"DEBUG: 渲染错误详情: {str(e)}")  # 临时打印错误信息，便于调试
-        logger.exception("Failed to render CAD to PNG")
+        logger.error(f"渲染错误详情: {str(e)}", exc_info=True)
         raise CADRenderError("Failed to render CAD to PNG") from e
 
+def render_cad_to_image(file_content: bytes, file_type: str) -> bytes:
+    """将DWG/DXF二进制内容渲染为图片二进制（适配OCR服务入参）"""
+    file_hash = hashlib.md5(file_content).hexdigest()
+    
+    # 1. 检查缓存
+    cache_data = _check_cache(file_hash)
+    if cache_data:
+        if cache_data["status"] == "success":
+            logger.info(f"复用缓存结果：{file_hash}")
+            return cache_data["result"]
+        elif cache_data["status"] == "processing":
+            raise CADRenderError(f"文件{file_hash}正在处理中，请稍后重试")
+    
+    # 2. 标记为处理中
+    _update_cache(file_hash, "processing")
+    
+    try:
+        temp_filename = f"temp_{file_type}_" + file_hash[:8] + f".{file_type}"
+        temp_cad_path = save_temp_file(file_content, temp_filename)
+        png_path = cad_to_png(temp_cad_path, f"{temp_filename}.png")
+        if not Path(png_path).exists():
+            raise CADRenderError(f"CAD渲染图片失败，PNG路径不存在：{png_path}")
+        
+        with open(png_path, "rb") as f:
+            img = Image.open(f)
+            # 1. 放大2倍（解决文字太小）
+            img = img.resize((img.width*2, img.height*2), Image.Resampling.LANCZOS)
+            # 2. 灰度化+增强对比度（和OCR预处理对齐）
+            img = img.convert("L")
+            img = ImageOps.autocontrast(img, cutoff=2)
+            # 3. 去噪
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+        
+            # 转成字节
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='PNG', dpi=(300, 300))
+            png_bytes = img_byte_arr.getvalue()
+
+        try:
+            os.remove(png_path)
+            logger.info(f"清理临时PNG文件：{png_path}")
+        except Exception as e:
+            logger.warning(f"清理临时PNG文件失败：{png_path}，错误：{str(e)}")
+
+
+        
+        # 3. 更新缓存为成功
+        _update_cache(file_hash, "success", png_bytes)
+        return png_bytes
+    
+    except Exception as e:
+        logger.error(f"CAD渲染为图片失败：{str(e)}", exc_info=True)
+        _update_cache(file_hash, "failed")
+        raise CADRenderError(f"CAD渲染为图片失败：{str(e)}") from e
 
 def process_dxf_service(file_content: bytes, filename: str) -> dict:
     """处理DXF文件：渲染为图片+OCR+AI审查+报告生成"""
+    file_hash = _get_file_hash(file_content)
+    # 1. 检查缓存
+    cache_data = _check_cache(file_hash)
+    if cache_data:
+        if cache_data["status"] == "success":
+            logger.info(f"复用缓存结果：{file_hash}")
+            return cache_data["result"]
+        elif cache_data["status"] == "processing":
+            raise CADRenderError(f"文件{file_hash}正在处理中，请稍后重试")
+    
+    # 2. 标记为处理中
+    _update_cache(file_hash, "processing")
+    
+    # 延迟导入
+    from app.services.ocr_service import perform_ocr_service
+    from app.services.common_service import generate_report_service
+    
     try:
-        # 1. 先保存DXF二进制内容为临时文件（因为cad_to_png需要文件路径）
         temp_dxf_path = save_temp_file(file_content, filename)
-        
-        # 2. DXF转PNG（传入临时文件路径，而非二进制）
         png_file_path = cad_to_png(str(temp_dxf_path), f"temp_{filename}.png")
         if not png_file_path or not Path(png_file_path).exists():
-            return {"status": "failed", "message": "DXF文件渲染图片失败"}
+            result = {"status": "failed", "message": "DXF文件渲染图片失败"}
+            _update_cache(file_hash, "failed", result)
+            return result
         
-        # 3. 读取PNG文件为二进制（适配OCR服务入参）
         with open(png_file_path, "rb") as f:
             png_content = f.read()
 
-        # 4. 调用OCR服务，文件类型标记为dxf便于后续区分
         ocr_result = perform_ocr_service(png_content, "dxf")
         if ocr_result["status"] != "success":
+            _update_cache(file_hash, "failed", ocr_result)
             return ocr_result
 
-        # 5. AI审查（补充drawing_name参数，适配函数定义）
-        ai_result = ai_review_service([ocr_result["structured_data"]], filename)
+        # 修复2：调用实例的ai_review_service方法
+        ai_result = ai_service_instance.ai_review_service([ocr_result["structured_data"]], filename)
         if ai_result["status"] != "success":
+            _update_cache(file_hash, "failed", ai_result)
             return ai_result
 
-        # 6. 生成报告
         report = generate_report_service(ai_result, filename)
-
-        return {
+        result = {
             "status": "success",
             "result": {"ocr": ocr_result, "ai_review": ai_result, "report": report},
             "message": "DXF文件处理完成"
         }
+        
+        _update_cache(file_hash, "success", result)
+        return result
+    
     except Exception as e:
-        logger.error(f"DXF文件处理异常：{str(e)}")
-        return {"status": "failed", "error": str(e), "message": "DXF文件处理失败"}
-
+        logger.error(f"DXF文件处理异常：{str(e)}", exc_info=True)
+        result = {"status": "failed", "error": str(e), "message": "DXF文件处理失败"}
+        _update_cache(file_hash, "failed", result)
+        return result
 
 def process_pdf_service(file_content: bytes, filename: str) -> dict:
     """处理PDF文件：提取所有页面图片+批量OCR+汇总AI审查+报告生成"""
+    # 延迟导入
+    from app.services.ocr_service import perform_ocr_service
+    from app.services.common_service import generate_report_service
+    
     try:
-        # 1. PDF转图片（依赖pdf2image，需确保已安装poppler）
-        images = convert_from_bytes(file_content)
+        # 1. PDF转图片（优化：增加参数避免中文乱码）
+        images = convert_from_bytes(
+            file_content,
+            dpi=300,
+            fmt="png",
+            size=(2000, None),
+            poppler_path=getattr(settings, "POPPLER_PATH", None)  # 支持配置poppler路径
+        )
         if not images:
             return {"status": "failed", "message": "PDF文件无有效页面可提取"}
         
         all_ocr_structured = []
-        # 2. 多页PDF循环做OCR
+        # 2. 多页PDF循环OCR
         for idx, img in enumerate(images):
-            # 图片转bytes（适配perform_ocr_service入参）
             img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
+            img.save(img_byte_arr, format='PNG', dpi=(300, 300))
             img_bytes = img_byte_arr.getvalue()
             
             ocr_res = perform_ocr_service(img_bytes, "pdf")
             if ocr_res["status"] != "success":
-                logger.warning(f"PDF第{idx+1}页OCR失败：{ocr_res.get('error')}")
+                logger.warning(f"PDF第{idx+1}页OCR失败：{ocr_res.get('error', '未知错误')}")
                 continue
             all_ocr_structured.append(ocr_res["structured_data"])
         
         if not all_ocr_structured:
             return {"status": "failed", "message": "PDF所有页面OCR识别失败"}
 
-        # 3. 汇总OCR结果做AI审查
-        ai_result = ai_review_service(all_ocr_structured, filename)
+        # 修复3：调用实例的ai_review_service方法
+        ai_result = ai_service_instance.ai_review_service(all_ocr_structured, filename)
         if ai_result["status"] != "success":
             return ai_result
 
@@ -410,34 +548,35 @@ def process_pdf_service(file_content: bytes, filename: str) -> dict:
 
         return {
             "status": "success",
-            "result": {"ocr_page_count": len(all_ocr_structured), "ocr": all_ocr_structured, "ai_review": ai_result, "report": report},
+            "result": {
+                "ocr_page_count": len(all_ocr_structured), 
+                "ocr": all_ocr_structured, 
+                "ai_review": ai_result, 
+                "report": report
+            },
             "message": f"PDF文件处理完成，共识别有效页面{len(all_ocr_structured)}页"
         }
     except ImportError as e:
-        logger.error(f"PDF处理依赖缺失：{str(e)}，需安装pdf2image和poppler")
-        return {"status": "failed", "error": str(e), "message": "PDF处理依赖未安装，请安装pdf2image"}
+        logger.error(f"PDF处理依赖缺失：{str(e)}，需安装pdf2image和poppler", exc_info=True)
+        return {"status": "failed", "error": str(e), "message": "PDF处理依赖未安装，请安装pdf2image和poppler"}
     except Exception as e:
-        logger.error(f"PDF文件处理异常：{str(e)}")
+        logger.error(f"PDF文件处理异常：{str(e)}", exc_info=True)
         return {"status": "failed", "error": str(e), "message": "PDF文件处理失败"}
 
-
-def render_cad_to_image(dxf_file_path: str) -> str:
-    """
-    将DXF文件渲染为图片
-    :param dxf_file_path: DXF文件的路径
-    :return: 生成的图片文件路径
-    """
-    # 1. 这里需要实现DXF到图片的渲染逻辑
-    # 2. 可以使用 ezdxf、matplotlib 等库来读取并渲染DXF文件
-    # 3. 将渲染结果保存为图片，例如PNG格式
-    # 4. 返回图片的路径
-    pass
-
-"""TODO: [未来优化] 考虑与 extract_layers_from_dxf 函数集成
-集成后，该函数可返回一个包含 "png_path" 和 "extracted_layers" 的字典，
-以在一次调用中同时获取图片和结构化数据，提高效率."""
-
-
+# ========== 通用临时文件保存函数（供全项目复用） ==========
+def universal_save_temp_file(file_content: bytes, filename: str, sub_dir: str = "cad") -> str:
+    """统一全项目的临时文件保存逻辑"""
+    file_hash = hashlib.md5(file_content).hexdigest()[:8] 
+    temp_dir = _get_project_root() / "temp" / sub_dir
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"{file_hash}_{filename}"
     
-
+    if temp_path.exists():
+        logger.info(f"复用临时文件：{temp_path}")
+        return str(temp_path)
+    
+    with open(temp_path, "wb") as f:
+        f.write(file_content)
+    logger.info(f"临时文件已保存：{temp_path}")
+    return str(temp_path)
 
